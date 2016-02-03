@@ -6,6 +6,20 @@ Copyright (C) 2002-2003  Maxim Krasnyansky <maxk@qualcomm.com>
 Copyright (C) 2002-2010  Marcel Holtmann <marcel@holtmann.org>
 
 
+MIDI over BLE
+=============
+
+Read more about the project at:
+* http://blog.felipetonello.com/2015/12/14/midi-over-bluetooth-low-energy-on-linux/
+* https://www.marc.info/?l=linux-bluetooth&m=144368891120651&w=4
+
+This branch[1] is under heavy development, so don't assume that things will not
+break or the histry log will not change, because it will!
+
+The idea is that most MIDI related commits will be squashed and cleaned-up.
+
+[1] https://github.com/ftonello/bluez/
+
 Compilation and installation
 ============================
 
