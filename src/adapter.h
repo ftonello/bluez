@@ -227,3 +227,7 @@ void btd_adapter_for_each_device(struct btd_adapter *adapter,
 
 bool btd_le_connect_before_pairing(void);
 
+void adapter_update_conn_param(struct btd_adapter *adapter, const bdaddr_t *peer,
+				uint8_t bdaddr_type, uint16_t min_interval,
+				uint16_t max_interval, uint16_t latency,
+				uint16_t timeout);

@@ -7326,8 +7326,8 @@ static void new_conn_param(uint16_t index, uint16_t length,
 		return;
 
 	store_conn_param(adapter, &ev->addr.bdaddr, ev->addr.type,
-					ev->min_interval, ev->max_interval,
-					ev->latency, ev->timeout);
+			ev->min_interval, ev->max_interval,
+			ev->latency, ev->timeout);
 }
 
 int adapter_set_io_capability(struct btd_adapter *adapter, uint8_t io_cap)
@@ -8601,4 +8601,38 @@ bool btd_le_connect_before_pairing(void)
 		return true;
 
 	return false;
+}
+
+void adapter_update_conn_param(struct btd_adapter *adapter, const bdaddr_t *peer,
+				uint8_t bdaddr_type, uint16_t min_interval,
+				uint16_t max_interval, uint16_t latency,
+				uint16_t timeout)
+{
+	struct mgmt_cp_update_conn_param cp;
+	unsigned int id;
+
+	/*
+	 * If the controller does not support Low Energy operation,
+	 * there is no point in trying to load the connection
+	 * parameters into the kernel.
+	 */
+	if (!(adapter->supported_settings & MGMT_SETTING_LE))
+		return;
+
+	store_conn_param(adapter, peer, bdaddr_type,
+	                 min_interval, max_interval,
+	                 latency, timeout);
+
+	bacpy(&cp.addr.bdaddr, peer);
+	cp.addr.type = bdaddr_type;
+	cp.min_interval = htobs(min_interval);
+	cp.max_interval = htobs(max_interval);
+	cp.latency = htobs(latency);
+	cp.timeout = htobs(timeout);
+
+	id = mgmt_send(adapter->mgmt, MGMT_OP_UPDATE_CONN_PARAM, adapter->dev_id,
+	               sizeof(cp), &cp, load_conn_params_complete, adapter, NULL);
+
+	if (id == 0)
+		btd_error(adapter->dev_id, "Update connection parameter failed");
 }
