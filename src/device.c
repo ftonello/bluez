@@ -6122,3 +6122,13 @@ void btd_device_cleanup(void)
 {
 	btd_service_remove_state_cb(service_state_cb_id);
 }
+
+void btd_device_set_conn_param(struct btd_device *device, uint16_t min_interval,
+					uint16_t max_interval, uint16_t latency,
+					uint16_t timeout)
+{
+	adapter_update_conn_param(device->adapter, &device->bdaddr,
+					device->bdaddr_type, min_interval,
+					max_interval, latency,
+					timeout);
+}

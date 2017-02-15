@@ -163,3 +163,7 @@ int btd_device_connect_services(struct btd_device *dev, GSList *services);
 
 void btd_device_init(void);
 void btd_device_cleanup(void);
+
+void btd_device_set_conn_param(struct btd_device *device, uint16_t min_interval,
+					uint16_t max_interval, uint16_t latency,
+					uint16_t timeout);
