@@ -40,6 +40,7 @@
 #define EIR_SSP_HASH                0x0E  /* SSP Hash */
 #define EIR_SSP_RANDOMIZER          0x0F  /* SSP Randomizer */
 #define EIR_DEVICE_ID               0x10  /* device ID */
+#define EIR_SLAVE_CONN_INT          0x12  /* Slave Connection Interval Range */
 #define EIR_SOLICIT16               0x14  /* LE: Solicit UUIDs, 16-bit */
 #define EIR_SOLICIT128              0x15  /* LE: Solicit UUIDs, 128-bit */
 #define EIR_SVC_DATA16              0x16  /* LE: Service data, 16-bit UUID */
@@ -90,6 +91,8 @@ struct eir_data {
 	uint16_t did_product;
 	uint16_t did_version;
 	uint16_t did_source;
+	uint16_t le_min_conn_interval;
+	uint16_t le_max_conn_interval;
 	GSList *msd_list;
 	GSList *sd_list;
 };

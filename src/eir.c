@@ -346,6 +346,13 @@ void eir_parse(struct eir_data *eir, const uint8_t *eir_data, uint8_t eir_len)
 			eir_parse_msd(eir, data, data_len);
 			break;
 
+		case EIR_SLAVE_CONN_INT:
+			if (data_len < 4)
+				break;
+			eir->le_min_conn_interval = get_le16(&data[0]);
+			eir->le_max_conn_interval = get_le16(&data[2]);
+			break;
+
 		}
 
 		eir_data += field_len + 1;
