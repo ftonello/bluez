@@ -1,7 +1,8 @@
 /*
  *  BlueZ - Bluetooth protocol stack for Linux
  *
- *  Copyright (C) 2017  Jarrod and Daniel Moura
+ *  Copyright (C) 2017  Jarrod
+ *  Copyright (C) 2017  Daniel Moura <oxe@oxesoft.com>
  *
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -27,11 +28,8 @@
 #include <stdlib.h>
 #include <getopt.h>
 #include <unistd.h>
-#include <errno.h>
 
 #include "lib/bluetooth.h"
-#include "lib/hci.h"
-#include "lib/hci_lib.h"
 #include "lib/l2cap.h"
 #include "lib/uuid.h"
 #include "lib/mgmt.h"
@@ -46,6 +44,7 @@
 #include "src/shared/gatt-server.h"
 #include "src/shared/mgmt.h"
 #include "src/shared/ad.h"
+
 #include "profiles/midi/libmidi.h"
 
 /* Defines */
@@ -58,7 +57,10 @@
  * server properties
  */
 struct server {
-	int fd;							/* File pointer for connection    */
+	int index;						/* Device index                   */
+	bdaddr_t addr;					/* Source address                 */
+	int addr_type;					/* Source address type            */
+	struct mgmt *mgmt;				/* Management interface           */
 	struct bt_att *att;				/* Attributes                     */
 	struct gatt_db *db;				/* Database                       */
 	struct bt_gatt_server *gatt;	/* The server                     */
@@ -83,7 +85,6 @@ struct server {
 
 /* Local Variables */
 static const char *gattName = "BLE-MIDI Device";
-static bool runServer = true;
 static bool verbose = false;
 
 /* Functions */
@@ -92,16 +93,215 @@ static void signal_cb(int signum, void *user_data)
 	switch (signum) {
 	case SIGINT:
 	case SIGTERM:
-		if (runServer) {
-			mainloop_quit();
-			runServer = false;
-		} else {
-			exit(0);
-		}
+		mainloop_quit();
 		break;
 	default:
 		break;
 	}
+}
+
+static void mgmt_generic_callback_complete(uint8_t status,
+	uint16_t length, const void *param, void *user_data)
+{
+	if (status != MGMT_STATUS_SUCCESS) {
+		fprintf(stderr, "%s failed: %s\n",
+		(char*)user_data, mgmt_errstr(status));
+		return;
+	}
+
+	if (verbose) {
+		printf("%s completed\n", (char*)user_data);
+	}
+}
+
+static void mgmt_generic_event(uint16_t index, uint16_t length,
+					const void *param, void *user_data)
+{
+	if (verbose) {
+		printf("%s\n", (char*)user_data);
+	}
+}
+
+static uint8_t* bt_ad_generate_data(size_t *adv_data_len)
+{
+	uint8_t *adv_data;
+	struct bt_ad *data;
+	bt_uuid_t uuid;
+	bt_string_to_uuid(&uuid, MIDI_UUID);
+
+	data = bt_ad_new();
+	if (!data) {
+		fprintf(stderr, "Error creating adverting data\n");
+		goto _error;
+	}
+
+	if (!bt_ad_add_service_uuid(data, &uuid)) {
+		fprintf(stderr, "Error adding service UUID\n");
+		goto _error;
+	}
+
+	adv_data = bt_ad_generate(data, adv_data_len);
+	if (!adv_data) {
+		fprintf(stderr, "Error generating advertising data\n");
+		goto _error;
+	}
+
+	bt_ad_unref(data);
+
+	return adv_data;
+
+_error:
+	bt_ad_unref(data);
+	return NULL;
+}
+
+static int advertise(struct server *server)
+{
+	int err = -1;
+	uint8_t *adv_data;
+	size_t adv_data_len;
+	struct mgmt_cp_load_conn_param *load_conn_params;
+	struct mgmt_conn_param *conn_param;
+	struct mgmt_cp_set_local_name *localname;
+	struct mgmt_cp_add_advertising *add_adv;
+	uint8_t load_conn_params_len;
+	uint8_t add_adv_len;
+	uint32_t flags;
+	uint8_t val;
+
+	adv_data = bt_ad_generate_data(&adv_data_len);
+	if (!adv_data) {
+		goto _error;
+	}
+
+	val = 0x00;
+	if (!mgmt_send(server->mgmt, MGMT_OP_SET_POWERED, server->index, 1,
+			&val, mgmt_generic_callback_complete, "MGMT_OP_SET_POWERED",
+			NULL)) {
+		fprintf(stderr, "Failed setting powered off\n");
+		goto _free_adv_data;
+	}
+
+	load_conn_params_len = sizeof(struct mgmt_cp_load_conn_param) +
+								sizeof(struct mgmt_conn_param);
+	load_conn_params = malloc0(load_conn_params_len);
+	if (!load_conn_params) {
+		fprintf(stderr, "Error allocating memory to load conn params\n");
+		goto _free_adv_data;
+	}
+
+	conn_param = malloc0(sizeof(struct mgmt_conn_param));
+	if (!conn_param) {
+		fprintf(stderr, "Error allocating memory to conn params\n");
+		goto _free_load_conn_params;
+	}
+
+	bacpy(&conn_param->addr.bdaddr, &server->addr);
+	conn_param->addr.type = server->addr_type;
+	conn_param->min_interval = 6;
+	conn_param->max_interval = 12;
+	conn_param->latency = 0;
+	conn_param->timeout = 200;
+	load_conn_params->param_count = 1;
+	memcpy(load_conn_params->params, conn_param,
+				sizeof(struct mgmt_conn_param));
+
+	if (!mgmt_send(server->mgmt, MGMT_OP_LOAD_CONN_PARAM,
+			server->index, load_conn_params_len, load_conn_params,
+			mgmt_generic_callback_complete, "MGMT_OP_LOAD_CONN_PARAM",
+		NULL)) {
+		fprintf(stderr, "Failed to load connection parameters\n");
+		goto _free_load_conn_params;
+	}
+
+	localname = malloc0(sizeof(struct mgmt_cp_set_local_name));
+	if (!localname) {
+		fprintf(stderr, "Error allocating memory to local name\n");
+		goto _free_load_conn_params;
+	}
+
+	strncpy(localname->name, gattName, MGMT_MAX_NAME_LENGTH);
+	strncpy(localname->short_name, gattName,
+			MGMT_MAX_SHORT_NAME_LENGTH);
+	if (!mgmt_send(server->mgmt, MGMT_OP_SET_LOCAL_NAME, server->index,
+			sizeof(struct mgmt_cp_set_local_name), localname,
+			mgmt_generic_callback_complete, "MGMT_OP_SET_LOCAL_NAME",
+			NULL)) {
+		fprintf(stderr, "Failed setting local name\n");
+		goto _free_local_name;
+	}
+
+	val = 0x01;
+	if (!mgmt_send(server->mgmt, MGMT_OP_SET_LE, server->index, 1,
+		&val, mgmt_generic_callback_complete, "MGMT_OP_SET_LE", NULL)) {
+		fprintf(stderr, "Failed setting low energy\n");
+		goto _free_local_name;
+	}
+
+	val = 0x01;
+	if (!mgmt_send(server->mgmt, MGMT_OP_SET_CONNECTABLE,
+			server->index, 1, &val, mgmt_generic_callback_complete,
+			"MGMT_OP_SET_CONNECTABLE", NULL)) {
+		fprintf(stderr, "Failed setting connectable\n");
+		goto _free_local_name;
+	}
+
+	add_adv_len = sizeof(struct mgmt_cp_add_advertising) + adv_data_len;
+	add_adv = malloc0(add_adv_len);
+	if (!add_adv) {
+		fprintf(stderr, "Error allocating memory"
+			"to advertising params\n");
+		goto _free_local_name;
+	}
+
+	flags = MGMT_ADV_FLAG_CONNECTABLE | MGMT_ADV_FLAG_DISCOV;
+	add_adv->instance = 1;
+	add_adv->flags = htobl(flags);
+	add_adv->duration = 0;
+	add_adv->timeout = 0;
+	add_adv->adv_data_len = adv_data_len;
+	add_adv->scan_rsp_len = 0;
+	memcpy(add_adv->data, adv_data, adv_data_len);
+
+	if (!mgmt_send(server->mgmt, MGMT_OP_ADD_ADVERTISING,
+			server->index, add_adv_len, add_adv,
+			mgmt_generic_callback_complete, "MGMT_OP_ADD_ADVERTISING",
+			NULL)) {
+		fprintf(stderr, "Failed to add advertising\n");
+		goto _free_add_adv;
+	}
+
+	mgmt_register(server->mgmt, MGMT_EV_DEVICE_CONNECTED,
+		server->index, mgmt_generic_event,
+		"MGMT_EV_DEVICE_CONNECTED", NULL);
+
+	mgmt_register(server->mgmt, MGMT_EV_DEVICE_DISCONNECTED,
+		server->index, mgmt_generic_event,
+		"MGMT_EV_DEVICE_DISCONNECTED", NULL);
+
+	val = 0x01;
+	if (!mgmt_send(server->mgmt, MGMT_OP_SET_POWERED, server->index, 1,
+		&val, mgmt_generic_callback_complete, "MGMT_OP_SET_POWERED",
+		NULL)) {
+		fprintf(stderr, "Failed setting powered on\n");
+		goto _free_add_adv;
+	}
+
+	err = 0;
+
+_free_add_adv:
+	free(add_adv);
+_free_local_name:
+	free(localname);
+_free_load_conn_params:
+	free(load_conn_params);
+_free_conn_param:
+	free(conn_param);
+_free_adv_data:
+	free(adv_data);
+_error:
+
+	return err;
 }
 
 static void att_disconnect_cb(int err, void *user_data)
@@ -110,11 +310,14 @@ static void att_disconnect_cb(int err, void *user_data)
 
 	midi_read_free(&server->midi_in);
 	midi_write_free(&server->midi_out);
+
 	if (server->io) {
 		io_destroy(server->io);
+		server->io = NULL;
 	}
 	if (server->seq_port_id >= 0) {
-		snd_seq_delete_simple_port(server->seq_handle, server->seq_port_id);
+		snd_seq_delete_simple_port(server->seq_handle,
+			server->seq_port_id);
 		server->seq_port_id = -1;
 	}
 	if (server->seq_handle) {
@@ -122,10 +325,11 @@ static void att_disconnect_cb(int err, void *user_data)
 		server->seq_handle = NULL;
 	}
 
-	mainloop_quit();
 	if (verbose) {
 		printf("Device disconnected: %s\n", strerror(err));
 	}
+
+	advertise(server);
 }
 
 static void att_debug_cb(const char *str, void *user_data)
@@ -140,7 +344,9 @@ static void gatt_debug_cb(const char *str, void *user_data)
 	printf("%s%s\n", prefix, str);
 }
 
-static void gap_device_name_read_cb(struct gatt_db_attribute *attrib, unsigned int id, uint16_t offset, uint8_t opcode, struct bt_att *att, void *user_data)
+static void gap_device_name_read_cb(struct gatt_db_attribute *attrib,
+	unsigned int id, uint16_t offset, uint8_t opcode,
+	struct bt_att *att, void *user_data)
 {
 	struct server *server = user_data;
 	uint8_t error = 0;
@@ -159,7 +365,10 @@ static void gap_device_name_read_cb(struct gatt_db_attribute *attrib, unsigned i
 	gatt_db_attribute_read_result(attrib, id, error, value, len);
 }
 
-static void gap_device_name_ext_prop_read_cb(struct gatt_db_attribute *attrib, unsigned int id, uint16_t offset, uint8_t opcode, struct bt_att *att, void *user_data)
+static void gap_device_name_ext_prop_read_cb(
+	struct gatt_db_attribute *attrib, unsigned int id,
+	uint16_t offset, uint8_t opcode, struct bt_att *att,
+	void *user_data)
 {
 	uint8_t value[2];
 
@@ -169,12 +378,17 @@ static void gap_device_name_ext_prop_read_cb(struct gatt_db_attribute *attrib, u
 	gatt_db_attribute_read_result(attrib, id, 0, value, sizeof(value));
 }
 
-static void gatt_service_changed_cb(struct gatt_db_attribute *attrib, unsigned int id, uint16_t offset, uint8_t opcode, struct bt_att *att, void *user_data)
+static void gatt_service_changed_cb(struct gatt_db_attribute *attrib,
+	unsigned int id, uint16_t offset, uint8_t opcode,
+	struct bt_att *att, void *user_data)
 {
 	gatt_db_attribute_read_result(attrib, id, 0, NULL, 0);
 }
 
-static void gatt_svc_chngd_ccc_read_cb(struct gatt_db_attribute *attrib, unsigned int id, uint16_t offset, uint8_t opcode, struct bt_att *att, void *user_data)
+static void gatt_svc_chngd_ccc_read_cb(
+	struct gatt_db_attribute *attrib, unsigned int id,
+	uint16_t offset, uint8_t opcode, struct bt_att *att,
+	void *user_data)
 {
 	struct server *server = user_data;
 	uint8_t value[2];
@@ -185,7 +399,10 @@ static void gatt_svc_chngd_ccc_read_cb(struct gatt_db_attribute *attrib, unsigne
 	gatt_db_attribute_read_result(attrib, id, 0, value, sizeof(value));
 }
 
-static void gatt_svc_chngd_ccc_write_cb(struct gatt_db_attribute *attrib, unsigned int id, uint16_t offset, const uint8_t *value, size_t len, uint8_t opcode, struct bt_att *att, void *user_data)
+static void gatt_svc_chngd_ccc_write_cb(
+	struct gatt_db_attribute *attrib, unsigned int id,
+	uint16_t offset, const uint8_t *value, size_t len,
+	uint8_t opcode, struct bt_att *att, void *user_data)
 {
 	struct server *server = user_data;
 	uint8_t ecode = 0;
@@ -205,13 +422,17 @@ static void gatt_svc_chngd_ccc_write_cb(struct gatt_db_attribute *attrib, unsign
 	gatt_db_attribute_write_result(attrib, id, ecode);
 }
 
-static void confirm_write(struct gatt_db_attribute *attr, int err, void *user_data) {
+static void confirm_write(struct gatt_db_attribute *attr, int err,
+	void *user_data)
+{
 	if (err && verbose) {
 		printf("Error caching attribute %p - err: %d\n", attr, err);
 	}
 }
 
-static void midi_ccc_write_cb(struct gatt_db_attribute *attrib, unsigned int id, uint16_t offset, const uint8_t *value, size_t len, uint8_t opcode, struct bt_att *att, void *user_data)
+static void midi_ccc_write_cb(struct gatt_db_attribute *attrib,
+	unsigned int id, uint16_t offset, const uint8_t *value,
+	size_t len, uint8_t opcode, struct bt_att *att, void *user_data)
 {
 	struct server *server = user_data;
 	uint8_t ecode = 0;
@@ -231,7 +452,9 @@ static void midi_ccc_write_cb(struct gatt_db_attribute *attrib, unsigned int id,
 	gatt_db_attribute_write_result(attrib, id, ecode);
 }
 
-static void midi_ccc_read_cb(struct gatt_db_attribute *attrib, unsigned int id, uint16_t offset, uint8_t opcode, struct bt_att *att, void *user_data)
+static void midi_ccc_read_cb(struct gatt_db_attribute *attrib,
+	unsigned int id, uint16_t offset, uint8_t opcode,
+	struct bt_att *att, void *user_data)
 {
 	struct server *server = user_data;
 	uint8_t value[2];
@@ -247,10 +470,15 @@ static bool midi_notify_cb(struct io *io, void *user_data)
 	struct server *server = user_data;
 	int err;
 
-	void foreach_cb(const struct midi_write_parser *parser, void *user_data) {
+	void foreach_cb(const struct midi_write_parser *parser,
+		void *user_data) {
 		struct server *server = user_data;
 		if (server->midi_notice_enabled) {
-			bt_gatt_server_send_notification(server->gatt, server->midi_io_handle, midi_write_data(parser), midi_write_data_size(parser));
+			bt_gatt_server_send_notification(
+				server->gatt,
+				server->midi_io_handle,
+				midi_write_data(parser),
+				midi_write_data_size(parser));
 		}
 	};
 
@@ -267,7 +495,11 @@ static bool midi_notify_cb(struct io *io, void *user_data)
 
 	if (midi_write_has_data(&server->midi_out)) {
 		if (server->midi_notice_enabled) {
-			bt_gatt_server_send_notification(server->gatt, server->midi_io_handle, (void *)midi_write_data(&server->midi_out), midi_write_data_size(&server->midi_out));
+			bt_gatt_server_send_notification(
+				server->gatt,
+				server->midi_io_handle,
+				(void *)midi_write_data(&server->midi_out),
+				midi_write_data_size(&server->midi_out));
 		}
 	}
 
@@ -276,7 +508,9 @@ static bool midi_notify_cb(struct io *io, void *user_data)
 	return true;
 }
 
-static void midi_write_cb(struct gatt_db_attribute *attrib, unsigned int id, uint16_t offset, const uint8_t *value, size_t len, uint8_t opcode, struct bt_att *att, void *user_data)
+static void midi_write_cb(struct gatt_db_attribute *attrib,
+	unsigned int id, uint16_t offset, const uint8_t *value,
+	size_t len, uint8_t opcode, struct bt_att *att, void *user_data)
 {
 	struct server *server = (struct server *)user_data;
 	snd_seq_event_t ev;
@@ -284,7 +518,9 @@ static void midi_write_cb(struct gatt_db_attribute *attrib, unsigned int id, uin
 	uint8_t ecode = 0;
 
 	if (len < 3) {
-		fprintf(stderr, "MIDI I/O: Wrong packet format: length is %u bytes but it should be at least 3 bytes\n", (unsigned int) len);
+		fprintf(stderr, "MIDI I/O: Wrong packet format: length"
+			"is %u bytes but it should be at least 3 bytes\n",
+			(unsigned int) len);
 		ecode = BT_ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LEN;
 	} else {
 		snd_seq_ev_clear(&ev);
@@ -295,7 +531,11 @@ static void midi_write_cb(struct gatt_db_attribute *attrib, unsigned int id, uin
 		midi_read_reset(&server->midi_in);
 
 		while (i < len) {
-			size_t count = midi_read_raw(&server->midi_in, value + i, len - i, &ev);
+			size_t count = midi_read_raw(
+				&server->midi_in,
+				value + i,
+				len - i,
+				&ev);
 
 			if (count == 0) {
 				fprintf(stderr, "Wrong BLE-MIDI message\n");
@@ -314,14 +554,15 @@ static void midi_write_cb(struct gatt_db_attribute *attrib, unsigned int id, uin
 	gatt_db_attribute_write_result(attrib, id, ecode);
 }
 
-static void populate_gap_service(struct server *server) {
+static void populate_gap_service(struct server *server)
+{
 	bt_uuid_t uuid;
 	struct gatt_db_attribute *service, *tmp;
 	uint16_t appearance;
 
 	/* Add the GAP service */
 	bt_uuid16_create(&uuid, UUID_GAP);
-	service = gatt_db_add_service(server->db, &uuid, true, 6);
+	service = gatt_db_add_service(server->db, &uuid, true, 3);
 
 	/*
 	 * Device Name characteristic. Make the value dynamically read and
@@ -330,8 +571,7 @@ static void populate_gap_service(struct server *server) {
 	bt_uuid16_create(&uuid, GATT_CHARAC_DEVICE_NAME);
 	gatt_db_service_add_characteristic(service, &uuid,
 					BT_ATT_PERM_READ,
-					BT_GATT_CHRC_PROP_READ |
-					BT_GATT_CHRC_PROP_EXT_PROP,
+					BT_GATT_CHRC_PROP_READ,
 					gap_device_name_read_cb,
 					NULL,
 					server);
@@ -341,8 +581,8 @@ static void populate_gap_service(struct server *server) {
 					gap_device_name_ext_prop_read_cb, NULL, server);
 
 	/*
-	 * Appearance characteristic. Reads and writes should obtain the value
-	 * from the database.
+	 * Appearance characteristic. Reads and writes should obtain the
+	 * value from the database.
 	 */
 	bt_uuid16_create(&uuid, GATT_CHARAC_APPEARANCE);
 	tmp = gatt_db_service_add_characteristic(service, &uuid,
@@ -351,8 +591,8 @@ static void populate_gap_service(struct server *server) {
 							NULL, NULL, server);
 
 	/*
-	 * Write the appearance value to the database, since we're not using a
-	 * callback.
+	 * Write the appearance value to the database, since we're not using
+	 * a callback.
 	 */
 	put_le16(128, &appearance);
 	gatt_db_attribute_write(tmp, 0, (void *) &appearance,
@@ -378,7 +618,8 @@ static void populate_gatt_service(struct server *server)
 			BT_GATT_CHRC_PROP_READ | BT_GATT_CHRC_PROP_INDICATE,
 			gatt_service_changed_cb,
 			NULL, server);
-	server->gatt_svc_chngd_handle = gatt_db_attribute_get_handle(svc_chngd);
+	server->gatt_svc_chngd_handle = gatt_db_attribute_get_handle(
+															svc_chngd);
 
 	bt_uuid16_create(&uuid, GATT_CLIENT_CHARAC_CFG_UUID);
 	gatt_db_service_add_descriptor(service, &uuid,
@@ -388,36 +629,73 @@ static void populate_gatt_service(struct server *server)
 	gatt_db_service_set_active(service, true);
 }
 
-static int populate_midi_service(struct server *server)
+static void populate_midi_service(struct server *server)
 {
 	bt_uuid_t uuid;
 	struct gatt_db_attribute *service;
-	struct pollfd pfd;
 	int err;
+
+	/* Add MIDI Service */
+	bt_string_to_uuid(&uuid, MIDI_UUID);
+	service = gatt_db_add_service(server->db, &uuid, true, 6);
+
+	/* Add MIDI IO Characteristics */
+	bt_string_to_uuid(&uuid, MIDI_IO_UUID);
+	server->midi_io = gatt_db_service_add_characteristic(
+		service,
+		&uuid,
+		BT_ATT_PERM_READ | BT_ATT_PERM_WRITE,
+		BT_GATT_CHRC_PROP_WRITE_WITHOUT_RESP |
+		BT_GATT_CHRC_PROP_READ |
+		BT_GATT_CHRC_PROP_NOTIFY,
+		NULL, midi_write_cb, server);
+	server->midi_io_handle = gatt_db_attribute_get_handle(
+													server->midi_io);
+
+	/* Add MIDI CCC */
+	bt_uuid16_create(&uuid, GATT_CLIENT_CHARAC_CFG_UUID);
+	gatt_db_service_add_descriptor(service, &uuid,
+					BT_ATT_PERM_READ | BT_ATT_PERM_WRITE,
+					midi_ccc_read_cb, midi_ccc_write_cb, server);
+
+	/* Activate Service */
+	gatt_db_service_set_active(service, true);
+}
+
+static int create_seq_port(struct server *server)
+{
+	int err;
+	struct pollfd pfd;
 	snd_seq_client_info_t *info;
 
 	/* ALSA Sequencer Client and Port Setup */
-	err = snd_seq_open(&server->seq_handle, "default", SND_SEQ_OPEN_DUPLEX, 0);
+	err = snd_seq_open(&server->seq_handle, "default",
+						SND_SEQ_OPEN_DUPLEX, 0);
 	if (err < 0) {
-		fprintf(stderr, "Could not open ALSA Sequencer: %s (%d)\n", snd_strerror(err), err);
-		return 1;
+		fprintf(
+			stderr, "Could not open ALSA Sequencer: %s (%d)\n",
+			snd_strerror(err), err);
+		return err;
 	}
 
 	err = snd_seq_nonblock(server->seq_handle, SND_SEQ_NONBLOCK);
 	if (err < 0) {
-		fprintf(stderr, "Could not set nonblock mode: %s (%d)\n", snd_strerror(err), err);
+		fprintf(stderr, "Could not set nonblock mode: %s (%d)\n",
+			snd_strerror(err), err);
 		goto _err_handle;
 	}
 
 	err = snd_seq_set_client_name(server->seq_handle, gattName);
 	if (err < 0) {
-		fprintf(stderr, "Could not configure ALSA client: %s (%d)\n", snd_strerror(err), err);
+		fprintf(stderr, "Could not configure ALSA client: %s (%d)\n",
+			snd_strerror(err), err);
 		goto _err_handle;
 	}
 
 	err = snd_seq_client_id(server->seq_handle);
 	if (err < 0) {
-		fprintf(stderr, "Could not retrieve ALSA client: %s (%d)\n", snd_strerror(err), err);
+		fprintf(stderr, "Could not retrieve ALSA client: %s (%d)\n",
+			snd_strerror(err), err);
 		goto _err_handle;
 	}
 	server->seq_client_id = err;
@@ -430,7 +708,8 @@ static int populate_midi_service(struct server *server)
 									 SND_SEQ_PORT_TYPE_MIDI_GENERIC |
 									 SND_SEQ_PORT_TYPE_HARDWARE);
 	if (err < 0) {
-		fprintf(stderr, "Could not create ALSA port: %s (%d)\n", snd_strerror(err), err);
+		fprintf(stderr, "Could not create ALSA port: %s (%d)\n",
+			snd_strerror(err), err);
 		goto _err_handle;
 	}
 	server->seq_port_id = err;
@@ -438,7 +717,8 @@ static int populate_midi_service(struct server *server)
 	snd_seq_client_info_alloca(&info);
 	err = snd_seq_get_client_info(server->seq_handle, info);
 	if (err < 0) {
-		fprintf(stderr, "Could not get client info: %s (%d)\n", snd_strerror(err), err);
+		fprintf(stderr, "Could not get client info: %s (%d)\n",
+			snd_strerror(err), err);
 		goto _err_port;
 	}
 
@@ -467,7 +747,8 @@ static int populate_midi_service(struct server *server)
 
 	err = snd_seq_set_client_info(server->seq_handle, info);
 	if (err < 0) {
-		fprintf(stderr, "Could not set client info: %s (%d)\n", snd_strerror(err), err);
+		fprintf(stderr, "Could not set client info: %s (%d)\n",
+			snd_strerror(err), err);
 		goto _err_port;
 	}
 	
@@ -495,27 +776,6 @@ static int populate_midi_service(struct server *server)
 		goto _err_midi;
 	}
 
-	/* Add MIDI Service */
-	bt_string_to_uuid(&uuid, MIDI_UUID);
-	service = gatt_db_add_service(server->db, &uuid, true, 6);
-
-	/* Add MIDI IO Characteristics */
-	bt_string_to_uuid(&uuid, MIDI_IO_UUID);
-	server->midi_io = gatt_db_service_add_characteristic(service, &uuid,
-						BT_ATT_PERM_READ | BT_ATT_PERM_WRITE,
-						BT_GATT_CHRC_PROP_WRITE_WITHOUT_RESP | BT_GATT_CHRC_PROP_READ | BT_GATT_CHRC_PROP_NOTIFY,
-						NULL, midi_write_cb, server);
-	server->midi_io_handle = gatt_db_attribute_get_handle(server->midi_io);
-
-	/* Add MIDI CCC */
-	bt_uuid16_create(&uuid, GATT_CLIENT_CHARAC_CFG_UUID);
-	gatt_db_service_add_descriptor(service, &uuid,
-					BT_ATT_PERM_READ | BT_ATT_PERM_WRITE,
-					midi_ccc_read_cb, midi_ccc_write_cb, server);
-
-	/* Activate Service */
-	gatt_db_service_set_active(service, true);
-
 	return 0;
 
 _err_midi:
@@ -528,152 +788,25 @@ _err_handle:
 	snd_seq_close(server->seq_handle);
 	server->seq_handle = NULL;
 
-	return -1;
+	return err;
 }
 
-static void add_adv_callback(uint8_t status, uint16_t length,
-							const void *param, void *user_data)
+static void att_conn_callback(int fd, uint32_t events, void *user_data)
 {
-// 	struct btd_adv_client *client = user_data;
-	const struct mgmt_rp_add_advertising *rp = param;
-
-	if (status)
-		goto done;
-
-	if (!param || length < sizeof(*rp)) {
-		status = MGMT_STATUS_FAILED;
-		goto done;
-	}
-done:
-	printf("Blz\n");
-}
-
-static int advertise(int dev_id)
-{
-	struct mgmt *mgmt_if = NULL;
-	struct bt_ad *data;
-	uint8_t *adv_data;
-	size_t adv_data_len;
-	struct mgmt_cp_add_advertising *cp;
-	uint8_t param_len;
-	bt_uuid_t uuid;
-	
-	bt_string_to_uuid(&uuid, MIDI_UUID);
-
-	mgmt_if = mgmt_new_default();
-	if (!mgmt_if) {
-		fprintf(stderr, "Failed to access management interface\n");
-		return -1;
-	}
-
-	data = bt_ad_new();
-	if (!data) {
-		fprintf(stderr, "Error creating adverting data\n");
-		return -1;
-	}
-
-	if (!bt_ad_add_service_uuid(data, &uuid)) {
-		fprintf(stderr, "Error adding service UUID\n");
-		return -1;
-	}
-
-	adv_data = bt_ad_generate(data, &adv_data_len);
-	if (!adv_data) {
-		fprintf(stderr, "Error generating advertising data\n");
-		return -1;
-	}
-
-	param_len = sizeof(struct mgmt_cp_add_advertising) + adv_data_len;
-	cp = malloc0(param_len);
-	if (!cp) {
-		fprintf(stderr, "Error allocating memory to advertising params\n");
-		return -1;
-	}
-
-	cp->flags = htobl(MGMT_ADV_FLAG_CONNECTABLE | MGMT_ADV_FLAG_DISCOV);
-	cp->instance = 0;
-	cp->adv_data_len = adv_data_len;
-	memcpy(cp->data, adv_data, adv_data_len);
-
-	free(adv_data);
-
-	if (!mgmt_send(mgmt_if, MGMT_OP_ADD_ADVERTISING, dev_id, param_len,
-				cp, add_adv_callback, NULL, NULL)) {
-		fprintf(stderr, "Failed to add Advertising Data");
-		free(cp);
-		return -1;
-	}
-
-	free(cp);
-	bt_ad_unref(data);
-	mgmt_unref(mgmt_if);
-
-	return 0;
-}
-
-static int l2cap_le_att_listen_and_accept(bdaddr_t *src, int sec,
-							uint8_t src_type)
-{
-	int sk, nsk;
-	struct sockaddr_l2 srcaddr, addr;
+	int err;
+	int new_fd;
+	struct sockaddr_l2 addr;
 	socklen_t optlen;
-	struct bt_security btsec;
 	char ba[18];
-	int dev_id;
-	
-	sk = socket(PF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_L2CAP);
-	if (sk < 0) {
-		perror("Failed to create L2CAP socket");
-		return -1;
-	}
-
-	dev_id = hci_get_route(src);
-	if (dev_id < 0) {
-		errno = ENODEV;
-		fprintf(stderr, "Device ID not found\n");
-		goto fail;
-	}
-
-	if (advertise(dev_id) != 0) {
-		goto fail;
-	}
-
-	/* Set up source address */
-	memset(&srcaddr, 0, sizeof(srcaddr));
-	srcaddr.l2_family = AF_BLUETOOTH;
-	srcaddr.l2_cid = htobs(ATT_CID);
-	srcaddr.l2_bdaddr_type = src_type;
-	bacpy(&srcaddr.l2_bdaddr, src);
-
-	if (bind(sk, (struct sockaddr *) &srcaddr, sizeof(srcaddr)) < 0) {
-		perror("Failed to bind L2CAP socket");
-		goto fail;
-	}
-
-	/* Set the security level */
-	memset(&btsec, 0, sizeof(btsec));
-	btsec.level = sec;
-	if (setsockopt(sk, SOL_BLUETOOTH, BT_SECURITY, &btsec,
-							sizeof(btsec)) != 0) {
-		fprintf(stderr, "Failed to set L2CAP security level\n");
-		goto fail;
-	}
-
-	if (listen(sk, 10) < 0) {
-		perror("Listening on socket failed");
-		goto fail;
-	}
-
-	if (verbose) {
-		printf("Started listening on ATT channel. Waiting for connections\n");
-	}
+	struct server *server = user_data;
+	uint16_t mtu = 0;
 
 	memset(&addr, 0, sizeof(addr));
 	optlen = sizeof(addr);
-	nsk = accept(sk, (struct sockaddr *) &addr, &optlen);
-	if (nsk < 0) {
+	new_fd = accept(fd, (struct sockaddr *) &addr, &optlen);
+	if (new_fd < 0) {
 		perror("Accept failed");
-		goto fail;
+		return;
 	}
 
 	if (verbose) {
@@ -681,80 +814,123 @@ static int l2cap_le_att_listen_and_accept(bdaddr_t *src, int sec,
 		printf("Connect from %s\n", ba);
 	}
 	
-	close(sk);
+	server->att = bt_att_new(new_fd, false);
 
-	return nsk;
+	if (!server->att) {
+		fprintf(stderr, "Failed to initialze ATT transport layer\n");
+		return;
+	}
+
+	bt_att_set_security(server->att, BT_SECURITY_LOW);
+
+	if (!bt_att_set_close_on_unref(server->att, true)) {
+		fprintf(stderr, "Failed to set up ATT transport layer\n");
+		goto _unref_att;
+	}
+
+	if (!bt_att_register_disconnect(server->att, att_disconnect_cb,
+		server, NULL)) {
+		fprintf(stderr, "Failed to set ATT disconnect handler\n");
+		goto _unref_att;
+	}
+	
+	server->gatt = bt_gatt_server_new(server->db, server->att, mtu);
+	if (!server->gatt) {
+		fprintf(stderr, "Failed to create GATT server\n");
+		goto _unref_att;
+	}
+
+	if (verbose) {
+		bt_att_set_debug(server->att, att_debug_cb, "att: ", NULL);
+		bt_gatt_server_set_debug(server->gatt, gatt_debug_cb, "srv: ", NULL);
+	}
+
+	err = create_seq_port(server);
+	if (err) {
+		goto _unref_gatt;
+	}
+
+	return;
+
+_unref_gatt:
+	bt_gatt_server_unref(server->gatt);
+	server->gatt = NULL;
+_unref_att:
+	bt_att_unref(server->att);
+	server->att = NULL;
+}
+
+static int l2cap_le_att_listen(bdaddr_t *src, uint8_t src_type)
+{
+	int att_fd;
+	struct sockaddr_l2 addr;
+	
+	att_fd = socket(PF_BLUETOOTH, SOCK_SEQPACKET | SOCK_CLOEXEC, BTPROTO_L2CAP);
+	if (att_fd < 0) {
+		perror("Failed to create L2CAP socket");
+		return -1;
+	}
+
+	/* Set up source address */
+	memset(&addr, 0, sizeof(addr));
+	addr.l2_family = AF_BLUETOOTH;
+	addr.l2_cid = htobs(ATT_CID);
+	bacpy(&addr.l2_bdaddr, src);
+	addr.l2_bdaddr_type = src_type;
+
+	if (bind(att_fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+		perror("Failed to bind L2CAP socket");
+		goto fail;
+	}
+
+	if (listen(att_fd, 1) < 0) {
+		perror("Listening on socket failed");
+		goto fail;
+	}
+
+	return att_fd;
 
 fail:
-	close(sk);
+	close(att_fd);
+
 	return -1;
 }
 
-static struct server *server_create(int fd, uint16_t mtu)
+static struct server *server_create()
 {
 	struct server *server;
-	size_t name_len = strlen(gattName);
-	int err;
 
 	server = new0(struct server, 1);
 	if (!server) {
 		fprintf(stderr, "Failed to allocate memory for server\n");
 		return NULL;
 	}
-
-	/* Init values */
-	server->io = NULL;
+	memset(server, 0, sizeof(struct server));
 	server->seq_port_id = -1;
-	server->seq_handle = NULL;
 
-	server->att = bt_att_new(fd, false);
-	if (!server->att) {
-		fprintf(stderr, "Failed to initialze ATT transport layer\n");
-		goto fail;
+	server->mgmt = mgmt_new_default();
+	if (!server->mgmt) {
+		fprintf(stderr, "Failed to access management interface\n");
+		goto _free_server;
 	}
 
-	if (!bt_att_set_close_on_unref(server->att, true)) {
-		fprintf(stderr, "Failed to set up ATT transport layer\n");
-		goto fail;
-	}
-
-	if (!bt_att_register_disconnect(server->att, att_disconnect_cb, server, NULL)) {
-		fprintf(stderr, "Failed to set ATT disconnect handler\n");
-		goto fail;
-	}
-
-	server->fd = fd;
 	server->db = gatt_db_new();
 	if (!server->db) {
 		fprintf(stderr, "Failed to create GATT database\n");
-		goto fail;
-	}
-
-	server->gatt = bt_gatt_server_new(server->db, server->att, mtu);
-	if (!server->gatt) {
-		fprintf(stderr, "Failed to create GATT server\n");
-		goto fail;
-	}
-
-	if (verbose) {
-		bt_att_set_debug(server->att, att_debug_cb, "att: ", NULL);
-		bt_gatt_server_set_debug(server->gatt, gatt_debug_cb, "server: ", NULL);
+		goto _unref_mgmt;
 	}
 
 	/* Populate our databases */
 	populate_gap_service(server);
 	populate_gatt_service(server);
-	err = populate_midi_service(server);
-	if (err < 0) {
-		fprintf(stderr, "Failed to populate midi service\n");
-		goto fail;
-	}
+	populate_midi_service(server);
 
 	return server;
 
-fail:
-	gatt_db_unref(server->db);
-	bt_att_unref(server->att);
+_unref_mgmt:
+	mgmt_unref(server->mgmt);
+	server->mgmt = NULL;
+_free_server:
 	free(server);
 
 	return NULL;
@@ -762,8 +938,30 @@ fail:
 
 static void server_destroy(struct server *server)
 {
-	bt_gatt_server_unref(server->gatt);
-	gatt_db_unref(server->db);
+	if (server->io) {
+		io_destroy(server->io);
+	}
+	if (server->seq_port_id >= 0) {
+		snd_seq_delete_simple_port(server->seq_handle, server->seq_port_id);
+		server->seq_port_id = -1;
+	}
+	if (server->seq_handle) {
+		snd_seq_close(server->seq_handle);
+		server->seq_handle = NULL;
+	}
+	if (server->gatt) {
+		bt_gatt_server_unref(server->gatt);
+	}
+	if (server->att) {
+		bt_att_unref(server->att);
+	}
+	if (server->db) {
+		gatt_db_unref(server->db);
+	}
+	if (server->mgmt) {
+		mgmt_unref(server->mgmt);
+	}
+	free(server);
 }
 
 static void usage(void)
@@ -772,95 +970,35 @@ static void usage(void)
 	printf("Usage:\n\tbtmidi-server [options]\n");
 
 	printf("Options:\n"
-		"\t-i, --index <id>\t\tSpecify adapter index, e.g. hci0\n"
-		"\t-m, --mtu <mtu>\t\t\tThe ATT MTU to use\n"
-		"\t-s, --security-level <sec>\tSet security level (low|"
-								"medium|high)\n"
-		"\t-t, --type [random|public] \t The source address type\n"
 		"\t-v, --verbose\t\t\tEnable extra logging\n"
-		"\t-n, --name\t\t\tSet the BLE device name\n"
-		"\t-h, --help\t\t\tDisplay help\n");
+		"\t-n, --name\t\t\tSet the BLE device name (default: %s)\n"
+		"\t-i, --index\t\t\tSet the device index (default: 0)\n"
+		"\t-h, --help\t\t\tDisplay help\n", gattName);
 }
 
 static struct option main_options[] = {
-	{ "index",		1, 0, 'i' },
-	{ "mtu",		1, 0, 'm' },
-	{ "security-level",	1, 0, 's' },
-	{ "type",		1, 0, 't' },
-	{ "verbose",		0, 0, 'v' },
+	{ "verbose",	0, 0, 'v' },
 	{ "name",		0, 0, 'n' },
+	{ "index",		0, 0, 'i' },
 	{ "help",		0, 0, 'h' },
 	{ }
 };
 
 int main(int argc, char *argv[])
 {
-	int opt;
-	bdaddr_t src_addr;
-	int dev_id = -1;
-	int fd;
-	int sec = BT_SECURITY_LOW;
-	uint8_t src_type = BDADDR_LE_PUBLIC;
-	uint16_t mtu = 0;
 	sigset_t mask;
+	bdaddr_t src_addr;
 	struct server *server;
+	int exit_status = EXIT_FAILURE;
+	int opt;
+	int fd;
+	int index = 0;
 
-	while ((opt = getopt_long(argc, argv, "+hvrs:t:m:i:",
+	while ((opt = getopt_long(argc, argv, "+hvn:i:",
 						main_options, NULL)) != -1) {
 		switch (opt) {
-		case 'h':
-			usage();
-			return EXIT_SUCCESS;
 		case 'v':
 			verbose = true;
-			break;
-		case 's':
-			if (strcmp(optarg, "low") == 0)
-				sec = BT_SECURITY_LOW;
-			else if (strcmp(optarg, "medium") == 0)
-				sec = BT_SECURITY_MEDIUM;
-			else if (strcmp(optarg, "high") == 0)
-				sec = BT_SECURITY_HIGH;
-			else {
-				fprintf(stderr, "Invalid security level\n");
-				return EXIT_FAILURE;
-			}
-			break;
-		case 't':
-			if (strcmp(optarg, "random") == 0)
-				src_type = BDADDR_LE_RANDOM;
-			else if (strcmp(optarg, "public") == 0)
-				src_type = BDADDR_LE_PUBLIC;
-			else {
-				fprintf(stderr,
-					"Allowed types: random, public\n");
-				return EXIT_FAILURE;
-			}
-			break;
-		case 'm': {
-			int arg;
-
-			arg = atoi(optarg);
-			if (arg <= 0) {
-				fprintf(stderr, "Invalid MTU: %d\n", arg);
-				return EXIT_FAILURE;
-			}
-
-			if (arg > UINT16_MAX) {
-				fprintf(stderr, "MTU too large: %d\n", arg);
-				return EXIT_FAILURE;
-			}
-
-			mtu = (uint16_t) arg;
-			break;
-		}
-		case 'i':
-			dev_id = hci_devid(optarg);
-			if (dev_id < 0) {
-				perror("Invalid adapter");
-				return EXIT_FAILURE;
-			}
-
 			break;
 		case 'n':
 			if (strlen(optarg) > 0) {
@@ -869,6 +1007,16 @@ int main(int argc, char *argv[])
 				perror("Missing name value");
 			}
 			break;
+		case 'i':
+			index = atoi(optarg);
+			if (index < 0) {
+				perror("Invalid adapter");
+				return EXIT_FAILURE;
+			}
+			break;
+		case 'h':
+			usage();
+			return EXIT_SUCCESS;
 		default:
 			fprintf(stderr, "Invalid option: %c\n", opt);
 			return EXIT_FAILURE;
@@ -884,44 +1032,58 @@ int main(int argc, char *argv[])
 		return EXIT_SUCCESS;
 	}
 
-	if (dev_id == -1)
-		bacpy(&src_addr, BDADDR_ANY);
-	else if (hci_devba(dev_id, &src_addr) < 0) {
-		perror("Adapter not available");
+	mainloop_init();
+
+	sigemptyset(&mask);
+	sigaddset(&mask, SIGINT);
+	sigaddset(&mask, SIGTERM);
+
+	mainloop_set_signal(&mask, signal_cb, NULL, NULL);
+
+	server = server_create();
+	if (!server) {
 		return EXIT_FAILURE;
 	}
 
-	while (runServer) {
-		int client;
-		int port;
-		
-		runServer = false;
-		
-		mainloop_init();
+	server->index = index;
+	hci_devba(index, &server->addr);
+	if (verbose) {
+		printf("addr: %02X:%02X:%02X:%02X:%02X:%02X\n",
+		server->addr.b[0],
+		server->addr.b[1],
+		server->addr.b[2],
+		server->addr.b[3],
+		server->addr.b[4],
+		server->addr.b[5]);
+	}
+	server->addr_type = BDADDR_LE_PUBLIC;
 
-		fd = l2cap_le_att_listen_and_accept(&src_addr, sec, src_type);
-		if (fd < 0) {
-			fprintf(stderr, "Failed to accept L2CAP ATT connection\n");
-			return EXIT_FAILURE;
-		}
-
-		server = server_create(fd, mtu);
-		if (!server) {
-			close(fd);
-			return EXIT_FAILURE;
-		}
-
-		runServer = true;
-		sigemptyset(&mask);
-		sigaddset(&mask, SIGINT);
-		sigaddset(&mask, SIGTERM);
-
-		mainloop_set_signal(&mask, signal_cb, NULL, NULL);
-
-		mainloop_run();
-
-		server_destroy(server);
+	fd = l2cap_le_att_listen(&server->addr, server->addr_type);
+	if (fd < 0) {
+		goto _destroy_server;
 	}
 
-	return EXIT_SUCCESS;
+	if (mainloop_add_fd(fd, EPOLLIN, att_conn_callback, server, NULL) < 0) {
+		perror("Erro adding connection callback to mainloop\n");
+		goto _close_fd;
+	}
+
+	if (verbose) {
+		printf("Started listening on ATT channel. Waiting for connections\n");
+	}
+
+	if (advertise(server) != 0) {
+		goto _remove_fd;
+	}
+
+	exit_status = mainloop_run();
+
+_remove_fd:
+	mainloop_remove_fd(fd);
+_close_fd:
+	close(fd);
+_destroy_server:
+	server_destroy(server);
+
+	return exit_status;
 }
