@@ -33,6 +33,8 @@
 #include "lib/l2cap.h"
 #include "lib/uuid.h"
 #include "lib/mgmt.h"
+#include "lib/hci.h"
+#include "lib/hci_lib.h"
 
 #include "src/shared/io.h"
 #include "src/shared/mainloop.h"
