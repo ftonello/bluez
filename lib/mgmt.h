@@ -546,6 +546,15 @@ struct mgmt_cp_set_appearance {
 	uint16_t appearance;
 } __packed;
 
+#define MGMT_OP_UPDATE_CONN_PARAM	0x0044
+struct mgmt_cp_update_conn_param {
+	struct mgmt_addr_info addr;
+	uint16_t min_interval;
+	uint16_t max_interval;
+	uint16_t latency;
+	uint16_t timeout;
+} __packed;
+
 #define MGMT_EV_CMD_COMPLETE		0x0001
 struct mgmt_ev_cmd_complete {
 	uint16_t opcode;
