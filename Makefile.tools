@@ -403,6 +403,16 @@ profiles_cups_bluetooth_LDADD = @GLIB_LIBS@ @DBUS_LIBS@ \
 				gdbus/libgdbus-internal.la
 endif
 
+if MIDI
+bin_PROGRAMS += tools/btmidi-server
+
+tools_btmidi_server_SOURCES = tools/btmidi-server.c src/uuid-helper.c profiles/midi/libmidi.h profiles/midi/libmidi.c
+tools_btmidi_server_CFLAGS = $(AM_CFLAGS) @ALSA_CFLAGS@ -DMIDI_TEST
+tools_btmidi_server_LDADD = src/libshared-mainloop.la \
+						lib/libbluetooth-internal.la \
+						@GLIB_LIBS@ @ALSA_LIBS@
+endif
+
 test_scripts += test/sap_client.py test/bluezutils.py \
 		test/dbusdef.py test/monitor-bluetooth test/list-devices \
 		test/test-discovery test/test-manager test/test-adapter \
